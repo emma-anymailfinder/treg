@@ -1334,6 +1334,7 @@ def test_platform_estimate_normalizes_per_result_pricing():
     per_row = {"type": "per_result", "usd": 0.0001}
     assert call_resolution._platform_estimate_micro(per_row, {}) == 0.0001 * call_resolution._PLATFORM_PAGE_DEFAULT * 1_000_000
     assert call_resolution._platform_estimate_micro(per_row, {"limit": "5"}) == 500
+    assert call_resolution._platform_estimate_micro(per_row, {"pastNMonths": "1"}) == 100  # spyfu: a row a month
     assert call_resolution._platform_estimate_micro(per_row, {"limit": "100000"}) == 0.0001 * call_resolution._PLATFORM_PAGE_MAX * 1_000_000
     assert call_resolution._platform_estimate_micro({"type": "per_call", "usd": None}, {}) == 0
     # rounds UP — a sub-micro fraction must never round to free
@@ -2304,16 +2305,80 @@ def test_observed_cost_counts_brightdata_records():
 
 
 def test_influencersclub_settle_counts_accounts():
+    """Verify influencersclub discovery settles at cost.value × credit_rate per row, not one whole
+    credit per row. unit_micro is ONE CREDIT ($0.598 = 598,000 micro-USD); cost.value is 0.01
+    credits per creator, so each creator costs $0.00598 = 5,980 micro-USD."""
     from types import SimpleNamespace
     from treg.application.call.settle import _observed_cost_micro
-    mk = SimpleNamespace(cost_type="per_result", unit_micro=5980, billed_oauth=False,
-                         endpoint_id="influencersclub.creators.search", provider="influencersclub")
+    # unit_micro = one whole credit = $0.598 = 598,000 micro-USD (from fx.yaml influencersclub rate)
+    # estimate_micro = reserve for 10 rows at 0.01 credits each = 10 × 5,980 = 59,800 micro-USD
+    mk = SimpleNamespace(cost_type="per_result", unit_micro=598_000, billed_oauth=False,
+                         endpoint_id="influencersclub.creators.search", provider="influencersclub",
+                         estimate_micro=59_800)
     body = json.dumps({"total": 634, "limit": 10,
                        "accounts": [{"user_id": i} for i in range(10)]}).encode()
-    # 10 creators returned → 10 × 5,980µ$ = $0.0598, NOT the 20-row estimate ($0.1196)
+    # 10 creators returned at 0.01 credits each → 10 × 0.01 × $0.598 = $0.0598 = 59,800 micro-USD
+    # (NOT 10 × $0.598 = $5.98 = 5,980,000 micro-USD, which was the ~100x bug)
     assert _observed_cost_micro(mk, body) == 59_800
     # an envelope with no rows costs nothing
     assert _observed_cost_micro(mk, json.dumps({"detail": "quota"}).encode()) == 0
+
+
+@pytest.mark.parametrize(('endpoint_id', 'rows', 'expected_micro'), [
+    # Regression tests for the ~100x billing bug fixed 2026-10: settlement was multiplying
+    # rows × unit_micro (one whole credit = $0.598) instead of rows × cost.value × unit_micro
+    # (0.01 credits = $0.00598 per creator). Catalog: cost.value=0.01, credit_rate=$0.598.
+    # Correct: per_row = 0.01 × 598,000 = 5,980 micro-USD ($0.00598)
+    #
+    # creators.search: 0.01 credits per creator
+    ("influencersclub.creators.search", 0, 0),        # 0 rows → $0
+    ("influencersclub.creators.search", 5, 29_900),   # 5 rows → $0.0299 (not $2.99)
+    ("influencersclub.creators.search", 10, 59_800),  # 10 rows → $0.0598 (not $5.98)
+    ("influencersclub.creators.search", 20, 119_600), # 20 rows → $0.1196 (not $11.96)
+    # creators.similar: same 0.01 credits per creator
+    ("influencersclub.creators.similar", 0, 0),
+    ("influencersclub.creators.similar", 5, 29_900),
+    ("influencersclub.creators.similar", 10, 59_800),
+    ("influencersclub.creators.similar", 20, 119_600),
+])
+def test_influencersclub_discovery_billing_regression(endpoint_id, rows, expected_micro):
+    """Verify influencersclub discovery endpoints bill at 0.01 credits per creator, not 1 credit.
+
+    Incident 2026-10: customers were charged ~100x the catalog price ($2.99 for 5 rows instead of
+    $0.0299). Root cause: settle.py multiplied rows by unit_micro (one credit = $0.598) instead
+    of by cost.value × unit_micro (0.01 credits = $0.00598 per row).
+    """
+    from types import SimpleNamespace
+    from treg.application.call.settle import _observed_cost_micro
+    # unit_micro = one credit = $0.598 = 598,000 micro-USD
+    # estimate_micro = reserve large enough to not cap the result
+    mk = SimpleNamespace(
+        cost_type="per_result", unit_micro=598_000, billed_oauth=False,
+        endpoint_id=endpoint_id, provider="influencersclub",
+        estimate_micro=rows * 5_980 + 100_000)  # add buffer to avoid capping
+    body = json.dumps({
+        "total": 100, "limit": rows,
+        "accounts": [{"user_id": i} for i in range(rows)] if rows else [],
+    }).encode()
+    assert _observed_cost_micro(mk, body) == expected_micro
+
+
+def test_influencersclub_settle_capped_at_hold():
+    """Settlement must never exceed the reserve (hold), even if more rows are returned than
+    requested. This prevents a rogue response from overbilling the caller."""
+    from types import SimpleNamespace
+    from treg.application.call.settle import _observed_cost_micro
+    mk = SimpleNamespace(
+        cost_type="per_result", unit_micro=598_000, billed_oauth=False,
+        endpoint_id="influencersclub.creators.search", provider="influencersclub",
+        estimate_micro=29_900)  # reserve for 5 rows = $0.0299
+    # Response returns 10 rows but only 5 were reserved
+    body = json.dumps({
+        "total": 100, "limit": 10,
+        "accounts": [{"user_id": i} for i in range(10)],
+    }).encode()
+    # Should be capped at the hold (29,900), not 10 × 5,980 = 59,800
+    assert _observed_cost_micro(mk, body) == 29_900
 
 
 @pytest.mark.parametrize(('query', 'count', 'page_size', 'credits'), [
@@ -2456,6 +2521,104 @@ def test_reported_charge_uses_catalog_path_for_any_provider(monkeypatch, amount,
     body = json.dumps({'billing': {'actual': amount}, 'credits': {'jobCredits': 999}}).encode()
     assert call_settle._observed_cost_micro(
         _mk('example', endpoint_id=endpoint['id']), body) == expected
+
+
+@pytest.mark.parametrize('endpoint', [
+    'oceanio.companies.lookalike', 'oceanio.companies.search', 'oceanio.people.search',
+])
+@pytest.mark.parametrize('size,valid', [(1, True), (100, True), (0, False),
+                                       (101, False), (True, False), ('10', False),
+                                       (None, False)])
+def test_oceanio_platform_search_reserve_matches_bounded_size(endpoint, size, valid):
+    cat = catalog_store.load()
+    ep = cat.by_id[endpoint]
+    body = json.dumps({'size': size}).encode()
+    if not valid:
+        with pytest.raises(ResolutionFailed) as exc:
+            call_resolution._enforce_platform_request(ep, body)
+        assert exc.value.detail['parameter'] == 'body.size'
+        return
+    call_resolution._enforce_platform_request(ep, body)
+    cost = cat.cost_view(ep['cost'], 'oceanio')
+    estimate, _ = call_resolution._marketplace_pricing('oceanio', endpoint, cost, {}, body)
+    assert estimate == size * 16_200
+
+
+@pytest.mark.parametrize('field', ['revealEmails', 'revealPhones'])
+def test_oceanio_platform_person_enrich_refuses_separately_billed_reveals(field):
+    ep = catalog_store.load().by_id['oceanio.people.enrich']
+    call_resolution._enforce_platform_request(ep, b'{"person":{"linkedin":"example"}}')
+    with pytest.raises(ResolutionFailed) as exc:
+        call_resolution._enforce_platform_request(
+            ep, json.dumps({'person': {'linkedin': 'example'}, field: {}}).encode())
+    assert exc.value.detail['parameter'] == f'body.{field}'
+
+
+@pytest.mark.parametrize('endpoint,credits,expected', [
+    ('oceanio.companies.lookalike', 0.2, 16_200),
+    ('oceanio.companies.search', 0, 0),
+    ('oceanio.people.search', 0.4, 32_400),
+    ('oceanio.people.enrich', 0.1, 8_100),
+])
+def test_oceanio_platform_settles_reported_credits(endpoint, credits, expected):
+    mk = _mk('oceanio', endpoint_id=endpoint, reported_charge_unit_micro=81_000)
+    assert call_settle._observed_cost_micro(
+        mk, json.dumps({'creditsUsed': credits}).encode()) == expected
+
+
+@pytest.mark.parametrize('endpoint,body,expected', [
+    ('oceanio.companies.lookalike',
+     {'size': 1, 'companiesFilters': {'lookalikeDomains': ['example.com']}}, 16_200),
+    ('oceanio.companies.search', {'size': 1}, 16_200),
+    ('oceanio.people.search', {'size': 1}, 16_200),
+    ('oceanio.people.enrich', {'person': {'linkedin': 'example'}}, 8_100),
+])
+async def test_oceanio_shared_key_calls_settle_reported_credits(
+    clients, monkeypatch, endpoint, body, expected,
+):
+    monkeypatch.setenv('TREG_PLATFORM_KEY_OCEANIO', 'PLATFORM-OCEANIO')
+    monkeypatch.setenv('TREG_PLATFORM_PROVIDERS', 'oceanio')
+    get_settings.cache_clear()
+
+    def upstream(request):
+        assert request.headers['x-api-token'] == 'PLATFORM-OCEANIO'
+        assert json.loads(request.content) == body
+        return _dropleads_response(200, {'creditsUsed': expected / 81_000})
+
+    try:
+        before = await _balance(clients)
+        async with AsyncClient(transport=httpx.MockTransport(upstream)) as vendor:
+            monkeypatch.setattr(A.app.state, 'http', vendor)
+            response = await clients.post(f'/call/{endpoint}', json=body)
+        assert response.status_code == 200, response.text
+        assert response.headers['x-treg-cost-micro'] == str(expected)
+        assert before - await _balance(clients) == expected
+    finally:
+        get_settings.cache_clear()
+
+
+async def test_oceanio_own_key_keeps_upstream_search_limit_and_is_unmetered(clients, monkeypatch):
+    monkeypatch.setenv('TREG_PLATFORM_KEY_OCEANIO', 'PLATFORM-OCEANIO')
+    monkeypatch.setenv('TREG_PLATFORM_PROVIDERS', 'oceanio')
+    get_settings.cache_clear()
+    saved = await clients.post('/secrets', json={'name': 'oceanio', 'value': 'OWN-OCEANIO'})
+    assert saved.status_code == 200, saved.text
+
+    def upstream(request):
+        assert request.headers['x-api-token'] == 'OWN-OCEANIO'
+        assert json.loads(request.content)['size'] == 101
+        return _dropleads_response(200, {'creditsUsed': 20.2})
+
+    try:
+        before = await _balance(clients)
+        async with AsyncClient(transport=httpx.MockTransport(upstream)) as vendor:
+            monkeypatch.setattr(A.app.state, 'http', vendor)
+            response = await clients.post('/call/oceanio.companies.search', json={'size': 101})
+        assert response.status_code == 200, response.text
+        assert 'x-treg-cost-micro' not in response.headers
+        assert await _balance(clients) == before
+    finally:
+        get_settings.cache_clear()
 
 
 @pytest.mark.parametrize('body,valid', [
@@ -2885,6 +3048,13 @@ def _usd_to_micro_for_test(usd) -> int:
     ("thecompaniesapi.companies.search", {"size": "10"}, None, b'{"companies":[{},{}]}', 2),
     # Findymail employee search: one credit per contact, never above the hold.
     ("findymail.search.employees", None, {"website": "x.io", "job_titles": ["CEO"], "count": 5}, b'[]', 0),
+    # SpyFu: one row per `results` item, an empty list is free, an unknown shape estimates.
+    ("spyfu.google.domain.overview", {"domain": "example.com", "pastNMonths": "1"}, None,
+     b'{"resultCount":1,"domain":"example.com","results":[{}]}', 1),
+    ("spyfu.google.domain.paid_keywords", {"query": "example.com", "pageSize": "10"}, None,
+     b'{"resultCount":0,"totalMatchingResults":0,"results":[]}', 0),
+    ("spyfu.google.domain.paid_keywords", {"query": "example.com", "pageSize": "10"}, None,
+     b'{"message":"unexpected"}', None),
 ])
 def test_per_result_search_settles_on_rows_returned_not_rows_requested(endpoint_id, query, req, body, rows):
     """Each reserves the requested page; the body says how many rows the vendor billed. The unit
@@ -3203,3 +3373,97 @@ def test_octen_runtime_uses_frozen_rates_and_checks_platform_shape():
         call_resolution._enforce_platform_request({"provider": "octen", "id": endpoint},
                                           json.dumps({"urls": ["https://example.com"] * 21}).encode())
     assert caught.value.kind == "catalog_parameter_invalid"
+
+
+async def test_an_answer_over_the_size_limit_is_not_kept_and_a_retry_never_runs_again(
+        clients: AsyncClient, platform_on, monkeypatch):
+    """Finding 5 (2026-09-21): retry rows kept every body whole for 24 h, up to 7.9 MB, while the
+    archive refuses anything over 2 MB. Over the limit, the caller still gets the full answer once;
+    a retry gets a stored 410 with the charge, and the provider is not called a second time."""
+    from sqlmodel import select
+
+    from treg.infra.db import session_maker
+    from treg.models import IdempotentCall
+
+    monkeypatch.setenv("TREG_ARCHIVE_MAX_BODY_BYTES", "10")      # any real answer is "large" now
+    get_settings.cache_clear()
+    calls = []
+    real = call_service.relay
+
+    async def counting(*a, **kw):
+        calls.append(1)
+        return await real(*a, **kw)
+    monkeypatch.setattr(call_service, "relay", counting)
+
+    headers = {"Idempotency-Key": "big-answer"}
+    first = await clients.get(f"/call/{EP}?aweme_id=big", headers=headers)
+    assert first.status_code == 200 and len(first.content) > 10, first.text   # the full answer, once
+    before = await _balance(clients)
+    retry = await clients.get(f"/call/{EP}?aweme_id=big", headers=headers)
+    assert retry.status_code == 410 and retry.headers["X-Treg-Idempotent-Replay"] == "true"
+    detail = retry.json()["detail"]
+    assert detail["error"] == "idempotency_response_too_large" and detail["size_bytes"] == len(first.content)
+    assert detail["call_id"] == first.headers["X-Treg-Call-Id"] and detail["charged_micro"] > 0
+    assert len(calls) == 1 and await _balance(clients) == before        # no second run, no second charge
+    async with session_maker() as db:
+        row = (await db.execute(select(IdempotentCall).where(IdempotentCall.key == "big-answer"))).scalar_one()
+    assert row.response_body != first.content and len(row.response_body) < 1000
+    get_settings.cache_clear()
+
+
+async def test_the_call_record_splits_out_the_providers_share_of_the_time(
+        clients: AsyncClient, platform_on, monkeypatch):
+    """Finding 7 (2026-09-21): only the total existed, including an OAuth refresh that makes its own
+    network request, so a slow call could not be pinned on the provider or on treg. A provider
+    that takes 300 ms shows it, inside the total."""
+    import asyncio
+
+    from sqlmodel import select
+
+    from treg.infra.db import session_maker
+    from treg.models import CallRecord
+
+    real = call_service.relay
+
+    async def slow_provider(*a, **kw):
+        await asyncio.sleep(0.3)
+        return await real(*a, **kw)
+
+    monkeypatch.setattr(call_service, "relay", slow_provider)
+    r = await clients.get(f"/call/{EP}?aweme_id=timed")
+    assert r.status_code == 200
+    await audit.drain()
+    async with session_maker() as db:
+        row = (await db.execute(select(CallRecord).where(
+            CallRecord.call_ref == r.headers["X-Treg-Call-Id"]))).scalar_one()
+    assert 300 <= row.upstream_ms < 450, row.upstream_ms
+    assert row.duration_ms >= row.upstream_ms, (row.duration_ms, row.upstream_ms)
+
+
+async def test_a_balance_refusal_asks_for_an_auto_top_up(clients: AsyncClient, platform_on, monkeypatch):
+    """Only a call that got through used to schedule a refill, so a team at $0 with auto top-up on
+    stayed empty until something else ran, refusing every call meanwhile."""
+    from treg.application import billing
+    from treg.models import Org
+
+    org_id = (await clients.get("/orgs")).json()[0]["org_id"]
+    async with session_maker() as db:
+        await ledger.reserve(db, org_id, "drain", 1_000_000)
+        org = await db.get(Org, org_id)
+        org.autotopup_enabled, org.autotopup_consented_at = True, billing._now()
+        org.stripe_customer_id, org.stripe_default_pm = "cus_x", "pm_x"
+        db.add(org)
+        await db.commit()
+    monkeypatch.setattr(billing, "configured", lambda: True)
+    asked: list[int] = []
+
+    async def fake_run(oid):
+        asked.append(oid)
+        billing._scheduled.discard(oid)
+    monkeypatch.setattr(billing, "_run_autotopup", fake_run)
+    r = await clients.get(f"/call/{EP}?aweme_id=7")
+    assert r.status_code == 402, r.text
+    import asyncio
+    await asyncio.sleep(0)
+    assert asked == [org_id]
+    assert "5 times per hour" in r.json()["detail"]["message"]

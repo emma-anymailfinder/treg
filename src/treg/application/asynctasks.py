@@ -13,6 +13,7 @@ from urllib.parse import quote
 from sqlalchemy import select, update
 
 from .. import archive, audit, oauth_providers
+from ..config import TREG_USER_AGENT
 from ..domain.governance.access import pinned_tag_predicates
 from ..domain import asynctasks
 from ..domain import money as ledger
@@ -456,10 +457,16 @@ async def settle_due(*, limit: int = DEFAULT_LIMIT, client: httpx.AsyncClient | 
     candidates = await _due_candidates(limit, now)
     if not candidates:
         return TickResult()
+    # Load the catalog before any poll starts, in a thread: `_poll_target` reads it, and the first
+    # read in a fresh worker process parses every provider file. Inside a poll that parse froze the
+    # event loop past POLL_TIMEOUT_S, so polls already in flight timed out without the provider
+    # being slow. After this the polls read the cached catalog and their timeout measures the
+    # provider alone.
+    await asyncio.to_thread(catalog_store.load)
     global_sem = asyncio.Semaphore(GLOBAL_CONCURRENCY)
     provider_sems: dict[str, asyncio.Semaphore] = {}
     owned = client is None
-    client = client or httpx.AsyncClient(timeout=POLL_TIMEOUT_S)
+    client = client or httpx.AsyncClient(timeout=POLL_TIMEOUT_S, headers={"User-Agent": TREG_USER_AGENT})
     claimed = 0
 
     async def run(call_id: str, provider: str) -> str:

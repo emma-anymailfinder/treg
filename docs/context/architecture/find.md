@@ -50,8 +50,9 @@ nothing here touches `store.search`, its scoring or the evidence rerank.
 
 Both stream the same two NDJSON events - `candidates` as soon as recall is computed, `judged` when
 the judge answers - so the pages animate the wait on the first. The judge abstains rather than
-fails; an abstaining judge falls back to the keyword page (`store.rank_band`, 25 rows, unjudged,
-verdict `keyword`), never to an error. `admit` rate limits per IP and per deployment through
+fails; an unambiguous provider name still opens that provider's tools, while other abstentions
+fall back to the keyword page (`store.rank_band`, 25 rows, unjudged, verdict `keyword`).
+`admit` rate limits per IP and per deployment through
 `ratestore` in a session committed and closed before the judge is called, and the evidence read
 (below) happens after the judge has answered: no request holds a connection while Jev thinks.
 
@@ -122,7 +123,8 @@ at any length, "exa"; or, from four letters, a prefix of exactly one provider's)
 model name. A word several platforms or providers share ("video", "search", "ads", "goog") names
 none of them, and the judged answer reads it. Product names come from endpoint names on the `AI generation` platforms: words two or
 more of those names share and names elsewhere rarely use ("gemini", "seedance", "flux"; not
-"image"), minus the keys of `aliases.yaml` ("tts" is a way of saying a job, not a product), and
+"image"), or, on a platform with a single endpoint, words of its name no other name uses ("jev"),
+minus the keys of `aliases.yaml` ("tts" is a way of saying a job, not a product), and
 adjacent pairs of them ("nano banana"), matched with spaces and hyphens folded away.
 On a shelf only a provider there counts.
 
@@ -166,7 +168,8 @@ The key is `find_embed_api_key`; left empty with the OpenRouter URL, treg's own 
 | 5 | the platform Choice is `none` with confidence >= `find_gap_min` | top under 0.6: `none`, `gap`; else `closest`, never strong |
 | 6 | a fit at or over high | `strong` |
 | 7 | a fit at or over keep | `closest` |
-| 8 | otherwise | `none`, reason `not_task` (`decide`'s `not_task` names the verdict: an agent's search asks for `keyword`, [search-experiment](search-experiment.md)) |
+| 8 | nothing kept, the platform Choice names a platform with confidence >= `find_gap_min` | `none`, reason `gap`: the catalog has the platform, not this job on it (posting to Threads where only reading it is listed) |
+| 9 | otherwise | `none`, reason `not_task` (`decide`'s `not_task` names the verdict: an agent's search asks for `keyword`, [search-experiment](search-experiment.md)) |
 
 Rule 5 sits before the strong rule: a confident "no platform provides this" caps the answer. On a
 shelf (`?platform=`) the platform Choice is not asked and any `none` is reason `scope`: that find read

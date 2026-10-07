@@ -129,11 +129,17 @@ _RATE_LIMITS: dict[str, dict] = {
     # endpoint-aware, protect the stricter search allowance and accept conservative enrichment.
     "prospeo": {"limit": 1, "window_s": 1, "source": "docs"},
     "aiark": {"limit": 5, "window_s": 1, "source": "docs"},
+    # The account allows 1,500 requests a minute (search and scrape share it). Pace the shared key at
+    # 1,000 so a burst waits briefly instead of collecting 429s; BYOK calls bypass this limiter.
+    "crawl4ai": {"limit": 1000, "window_s": 60, "source": "policy"},
     # Provisional: Wiza publishes 30/min for company enrichment, but not for search or autocomplete.
     # Reuse that ceiling provider-wide because smoothing is not endpoint-aware yet. This spaces
     # sequential platform calls by about 2s; the limiter's bounded wait is not a strict quota gate.
     # Relax this after real 429 evidence, or when smoothing can vary by endpoint. BYOK bypasses it.
     "wiza": {"limit": 30, "window_s": 60, "source": "docs"},
+    # Ocean.io documents 60/min and 1,000/day for self-serve API access. Pace the shared key at
+    # half the minute allowance; the free balance collector observes the separate daily counter.
+    "oceanio": {"limit": 30, "window_s": 60, "source": "policy"},
     # The Basic v2 docs set a shared one-request/second default. Several routes are exempt, but
     # provider-wide smoothing cannot express that difference, so shared-key service stays at 1/s.
     "limadata": {"limit": 1, "window_s": 1, "source": "docs"},

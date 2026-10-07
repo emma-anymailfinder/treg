@@ -979,9 +979,15 @@ FACEBOOK = OAuthProvider(
     discover_label_field="name",
     discover_extra_path="/me/businesses?fields=owned_pages{id,name},client_pages{id,name}",
     discover_extra_list_paths=_META_BIZ_PAGE_LISTS,
-    # /me returns the person, not the Page, and needs no extra scope — so it keeps working even for
-    # a connection whose Page was later unassigned, which is exactly when you want the probe to
-    # still distinguish "credential dead" from "asset gone".
+    # Every Page edge rejects the user token (code 190 / subcode 2069032). Picking the Page derives
+    # its Page token from the same listings, and calls inject that; the user token stays for the
+    # picker. One connection therefore acts on one Page.
+    call_token_field="page_access_token",
+    resource_token_path="/me/accounts?fields=id,access_token",
+    resource_token_extra_path="/me/businesses?fields=owned_pages{id,access_token},client_pages{id,access_token}",
+    resource_token_extra_list_paths=_META_BIZ_PAGE_LISTS,
+    # /me needs no extra scope. It returns the person before a Page is selected and the Page after,
+    # so it answers for whichever token the tool injects.
     probe_path="/me?fields=id,name",
 )
 
@@ -2803,6 +2809,37 @@ FIRECRAWL = OAuthProvider(
     probe_path="/v2/team/credit-usage",
 )
 
+CRAWL4AI = OAuthProvider(
+    service="crawl4ai",
+    display_name="Crawl4AI",
+    auth_kind="key",
+    token_label="API key",
+    token_placeholder="sk_live_…",
+    # Bearer, not the also-accepted `x-api-key`, matching every Crawl4AI doc example. A bogus or
+    # missing key answers 401 {"error": "sign in"} on the probe (live 2026-10-05).
+    token_header="Authorization",
+    token_format="Bearer {secret}",
+    setup_url="https://api.crawl4ai.com/dashboard/",
+    setup_action_label="Get your Crawl4AI API key",
+    setup_steps=(
+        "Open the Crawl4AI dashboard and click Get a key (a 7-day pass key is issued at once).",
+        "Verify your email for a permanent key and the signup credit, then copy it.",
+    ),
+    setup_note=(
+        "Scrape, search, extract, answer, batch, jobs and recipes spend Crawl4AI credits "
+        "(1 credit = $0.001; a page already in its archive costs half). "
+        "Connecting checks the free balance endpoint."
+    ),
+    auth_uri="", token_uri="",
+    scopes={},
+    client_id_setting="", client_secret_setting="",
+    category="SEO",
+    summary="Scrape any page to clean Markdown, search the web, and extract typed JSON from pages.",
+    base_url="https://api.crawl4ai.com",
+    docs_url="https://api.crawl4ai.com/docs",
+    probe_path="/v1/billing/balance",  # free: reads the credit balance, spends nothing
+)
+
 SPIDERCLOUD = OAuthProvider(
     service="spidercloud",
     display_name="Spider",
@@ -3879,7 +3916,7 @@ REGISTRY: dict[str, OAuthProvider] = {
         TIKHUB, BRIGHTDATA, SEMRUSH, JUSTONEAPI,
         SCRAPECREATORS,
         # SEO API-key providers
-        DATAFORSEO, SERANKING, MOZ, MAJESTIC, SERPSTAT, EXA, SEARCH1API, TAVILY, OCTEN, LINKUP, YOU, VALYU, KEENABLE, OLOSTEP, FIRECRAWL, SPIDERCLOUD, PERPLEXITY,
+        DATAFORSEO, SERANKING, MOZ, MAJESTIC, SERPSTAT, EXA, SEARCH1API, TAVILY, OCTEN, LINKUP, YOU, VALYU, KEENABLE, OLOSTEP, FIRECRAWL, CRAWL4AI, SPIDERCLOUD, PERPLEXITY,
         SCRAPEGRAPHAI, SERPER, LITESCRAPE, CLORO,
         # more Enrichment API-key providers
         LUSHA, CORESIGNAL, DIFFBOT, THECOMPANIESAPI, LEADMAGIC, ENRICHLAYER, FIBER_AI, CRUSTDATA, AVIATO,

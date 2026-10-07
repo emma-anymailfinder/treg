@@ -236,6 +236,13 @@ def _serpstat_result_count(doc: object) -> int | None:
     return None
 
 
+def _spyfu_result_count(doc: object) -> int | None:
+    """Rows a SpyFu answer bills. Every endpoint answers `{"resultCount": N, "results": [...]}` and
+    SpyFu bills per row returned, so an empty list is free. Any other shape settles at the estimate."""
+    results = doc.get("results") if isinstance(doc, dict) else None
+    return len(results) if isinstance(results, list) else None
+
+
 def _rows_billed_micro(mk: MarketplaceCall, ep: dict | None, rows: int | None,
                        credits_per_row: Decimal | None = None) -> int | None:
     """What `rows` billed rows cost, never more than the hold. For a credit-priced row
@@ -386,7 +393,22 @@ _CREDIT_HEADERS = {
     "crustdata": ("x-credits-used", 1),
     "cloro": ("x-credits-charged", 1),
     "aiark": ("x-credit", -1),
+    "crawl4ai": ("x-c4-cost", 1),
 }
+
+
+def _usage_document(body: bytes):
+    """The document a `settle: usage` path reads: the JSON body, or, for an NDJSON stream, its LAST
+    line (a stream that closes with a summary line totalling the call)."""
+    try:
+        return json.loads(body)
+    except ValueError:
+        pass
+    last = next((ln for ln in reversed(body.splitlines()) if ln.strip()), b"")
+    try:
+        return json.loads(last) if last else None
+    except ValueError:
+        return None
 
 
 def _observed_cost_micro(mk: MarketplaceCall, body: bytes, headers=None) -> int | None:
@@ -545,6 +567,8 @@ def _observed_cost_micro(mk: MarketplaceCall, body: bytes, headers=None) -> int 
                                   Decimal("0.5") if company else None)
     if provider == "serpstat" and mk.cost_type == "per_result" and mk.unit_micro > 0:
         return _rows_billed_micro(mk, ep, _serpstat_result_count(doc))
+    if provider == "spyfu" and mk.cost_type == "per_result" and mk.unit_micro > 0:
+        return _rows_billed_micro(mk, ep, _spyfu_result_count(doc))
     if provider == "thecompaniesapi":
         # `simplified=true` returns a reduced record for zero credits on the endpoints that declare
         # it (catalog notes); otherwise the company search bills one credit per company RETURNED,
@@ -585,27 +609,29 @@ def _observed_cost_micro(mk: MarketplaceCall, body: bytes, headers=None) -> int 
         # Missing or invalid charge evidence leaves the normal miss/base rules in force.
     if provider == "sumble":
         credits = doc.get("credits_used")
-        # The request-time unit freezes the credit rate, including legitimate zero usage.
+        # The request-time credit freezes the rate, including legitimate zero usage. Not
+        # `unit_micro`: on a per_success row that is the whole call (50 credits for a brief).
         if type(credits) is int and credits >= 0:
-            return credits * mk.unit_micro
+            return credits * mk.reported_charge_unit_micro
         return None
     if provider == "scrubby":
         credits = doc.get("credits_used")
         # Scrubby reports the exact per-call charge, including zero for a cached retry.
-        # The request-time unit freezes the supplied $/credit acquisition rate.
+        # The request-time credit freezes the supplied $/credit acquisition rate.
         if type(credits) is int and credits >= 0:
-            return credits * mk.unit_micro
+            return credits * mk.reported_charge_unit_micro
         return None
     if provider == "datagma":
         # Datagma returns the exact charge as a numeric string, including zero for cached repeats
-        # and misses. Use the request-time unit so a later catalog price edit cannot change a call
-        # already in flight.
+        # and misses. Use the request-time credit so a later catalog price edit cannot change a
+        # call already in flight. Not `unit_micro`: on phone find that is all 30 credits, which
+        # billed `creditBurn: 30` as 900.
         raw = doc.get("creditBurn")
         if isinstance(raw, (int, float, str)) and not isinstance(raw, bool):
             try:
                 credits = Decimal(str(raw))
                 if credits.is_finite() and credits >= 0:
-                    return int((credits * mk.unit_micro).quantize(
+                    return int((credits * mk.reported_charge_unit_micro).quantize(
                         Decimal("1"), rounding=ROUND_HALF_UP))
             except (InvalidOperation, ValueError, OverflowError):
                 pass
@@ -649,13 +675,15 @@ def _observed_cost_micro(mk: MarketplaceCall, body: bytes, headers=None) -> int 
         n = len(data) if isinstance(data, list) else (1 if data else 0)
         return n * mk.unit_micro
     if provider == "influencersclub" and mk.cost_type == "per_result" and mk.unit_micro > 0:
-        # Discovery bills per creator RETURNED and the rows live under `accounts` — invisible to
-        # the generic counters, so every call settled at the 20-row default estimate (found live
-        # 2026-08-30: 66 searches, ~10 rows each, billed as 20 each — a 2.08x overcharge). An
-        # envelope without `accounts` (an error shape) counts zero: pay-per-result means an answer
-        # with no rows costs nothing.
+        # Discovery bills per creator RETURNED (cost.value credits each, e.g. 0.01 for search/similar,
+        # 0.03 for search with return_filter_values=true). The `accounts` array is invisible to the
+        # generic counters. An envelope without `accounts` (an error shape) costs nothing.
+        # BUG FIX 2026-10: the original code multiplied rows by mk.unit_micro (one whole credit =
+        # $0.598) instead of by cost.value × unit_micro (0.01 credits = $0.00598 per row), causing
+        # ~100x overbilling. Use _rows_billed_micro which correctly applies cost.value.
         rows = doc.get("accounts")
-        return (sum(item is not None for item in rows) if isinstance(rows, list) else 0) * mk.unit_micro
+        row_count = sum(item is not None for item in rows) if isinstance(rows, list) else 0
+        return _rows_billed_micro(mk, ep, row_count)
     if provider == "dataforseo":
         cost = doc.get("cost")
         if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
@@ -1143,10 +1171,7 @@ async def _platform_settle(
     # instead of the reported $0.0000157).
     terminal = None
     if billable and (mk.settlement_basis.get("amount") or {}).get("kind") == "usage" and body:
-        try:
-            terminal = json.loads(body)
-        except ValueError:
-            terminal = None
+        terminal = _usage_document(body)
     actual = ((0 if observed == 0 else settlement_basis.settle(
         mk.settlement_basis, {"observed_micro": observed, "terminal": terminal})) if billable else None)
     repeat_percent = get_settings().archive_hit_repeat_price_percent
@@ -1368,7 +1393,7 @@ async def _note_capacity_signal(mk: MarketplaceCall, status_code: int, headers, 
 
 async def _note_capacity_recovery(mk: MarketplaceCall) -> None:
     """After a tier-4 2xx: clear pending strikes on the endpoint and the provider, and the active
-    lock this call was admitted through as a probe. Reloads the view first (a no-op inside the
+    lock or sweep reading this call was admitted through as a probe. Reloads the view first (a no-op inside the
     TTL) so a strike written while this call was in flight is not missed. Never raises."""
     if mk.tier != "platform":
         return
@@ -1383,6 +1408,12 @@ async def _note_capacity_recovery(mk: MarketplaceCall) -> None:
                 if lock.is_active():
                     logging.getLogger("treg.capacity").warning(
                         "platform account recovered: %s (probe on %s)", lock.key, mk.endpoint_id)
+        if ((mk.probe_lock_id or "").startswith(capacity_marks.SWEEP_PROBE)
+                and await capacity_marks.clear_sweep_state(mk.provider, probe_id=mk.probe_lock_id)):
+            cleared = True
+            logging.getLogger("treg.capacity").warning(
+                "platform account recovered: %s (probe on %s lifted the sweep's reading)",
+                mk.provider, mk.endpoint_id)
         if cleared:
             capacity_view.invalidate()
     except asyncio.CancelledError:

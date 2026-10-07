@@ -15,12 +15,12 @@ name? - and a name is answered with the platform or provider it names, under its
 
 Two phases, because the recall is instant and the judge is not: `stream` yields the candidates
 first and the judged rows when they arrive, and the pages animate the wait on the first event. The
-judge abstains rather than fails (see `infra.judge`); an abstaining judge falls back to the keyword
-page, labelled as such, never to an error.
+judge abstains rather than fails (see `infra.judge`); an unambiguous provider name still opens that
+provider's tools, and other abstentions fall back to the keyword page, never to an error.
 
 Two engines behind `find_engine` (docs/context/architecture/find.md). v1, above: endpoint recall.
 v2: recall by JOB (`domain.catalog.find_recall`), so one judge seat carries every vendor of a job,
-the same single request also asks which platform the task needs, eight rules decide the verdict
+the same single request also asks which platform the task needs, nine rules decide the verdict
 (`decide`), and a fitting job lists all its vendors (`expand`). `shadow` serves v1 and logs v2.
 
 Session discipline: `admit` opens, commits and closes its own session BEFORE the judge's upstream
@@ -201,12 +201,21 @@ async def judge(query: str, cands: list[tuple[dict, float]], cat: catalog_store.
                                 url=s.typesafe_url, timeout_s=float(s.find_timeout_s),
                                 criteria=FIT_CRITERIA, extra={"name": NAME_QUESTION} if views else None)
     if j.probs is None:
+        hit = find_recall.name_of(query, find_recall.index(cat), platform, provider_display)
+        if hit and hit.kind == "provider":
+            return Judged(NAME, [(ep, None) for ep in name_page(hit, cat, platform)], j,
+                          named="provider")
         page, _, _ = catalog_store.rank_band(query, cat, 25, platform)
         return Judged(KEYWORD, [(ep, None) for ep, _ in page[:25]], j)
     keep, high = float(s.search_judge_keep), float(s.search_judge_high)
     scored = sorted(zip((ep for ep, _ in cands), j.probs), key=lambda t: -t[1])
     strong = bool(scored) and scored[0][1] >= high
     kept = [(ep, p) for ep, p in scored if p >= keep]
+    if not strong:
+        hit = find_recall.name_of(query, find_recall.index(cat), platform, provider_display)
+        if hit and hit.kind == "provider":
+            return Judged(NAME, [(ep, None) for ep in name_page(hit, cat, platform)], j,
+                          kept, "provider")
     if not strong and ((j.extra or {}).get("name", 0.0) >= float(s.find_name_min)
                        or (not platform and names_a_platform(query, cat))):
         named, rows = name_rows(query, cat, provider_display, platform)
@@ -221,7 +230,7 @@ async def stream(query: str, provider_display, platform: str | None = None,
     rows and the verdict, when the judge answers). Logged once the answer is out. `high` rides
     along so the pages draw the strong cut from this server's setting, not a copy.
 
-    `find_engine` picks the answer: `v1` (endpoint recall), `v2` (job recall and the eight rules),
+    `find_engine` picks the answer: `v1` (endpoint recall), `v2` (job recall and the nine rules),
     or `shadow` - v1 is served and v2 runs beside it, its judge request in parallel, for the log
     only. `platform` scopes the whole find to one shelf. `evidence` reads the measured success of
     endpoint ids (the evidence rerank's input) once the judge has answered; None = unmeasured."""
@@ -278,7 +287,7 @@ def _log(query: str, *, source: str, baseline_total: int, cands: list[tuple[dict
                                  reason=JUDGE_OFF if judged.verdict == KEYWORD else None)
 
 
-# ==== v2: recall by job, one judge request, eight rules ===========================================
+# ==== v2: recall by job, one judge request, nine rules ============================================
 # Why a `none` has nothing to show: the catalog lacks it (a gap, worth recording), or the text is
 # not a task the page can read; `judge_off` is the keyword fallback that found nothing. A shelf's
 # find reads that shelf only, so its `none` is `scope`: it cannot say the catalog lacks anything.
@@ -419,13 +428,18 @@ def decide(query: str, cands: list[find_recall.Candidate], j: judge_infra.Judgem
     5. the judge picks no platform with confidence: none/gap under `CAPPED_TOP`, else closest (never strong)
     6. a fit at or over high: strong
     7. a fit at or over keep: closest
-    8. otherwise: `not_task` (none for a person; an agent's search passes keyword, since its input
+    8. nothing kept and the judge picked a platform with confidence: none/gap (the catalog has the
+       platform, not this job on it: a gap worth recording)
+    9. otherwise: `not_task` (none for a person; an agent's search passes keyword, since its input
        always means something and the keyword page serves it), reason not_task
 
     On a shelf (`platform`) any `none` is `scope`: that find read one shelf.
     """
     s = get_settings()
     if j.probs is None:
+        hit = find_recall.name_of(query, ix, platform, provider_display)
+        if hit and hit.kind == "provider":
+            return Found(NAME, j, cands, name=hit)
         return Found(KEYWORD, j, cands, reason=j.error or "")
     keep, high = float(s.search_judge_keep), float(s.search_judge_high)
     scored = sorted(zip(cands, j.probs), key=lambda t: -t[1])
@@ -449,6 +463,8 @@ def decide(query: str, cands: list[find_recall.Candidate], j: judge_infra.Judgem
         found.verdict = STRONG
     elif kept:
         found.verdict = CLOSEST
+    elif plat and plat["choice"] != "none" and plat["confidence"] >= float(s.find_gap_min):
+        found.reason = GAP        # the platform is in the catalog; this job on it is not
     else:
         found.verdict, found.reason = not_task, NOT_TASK
     if found.verdict in (NONE, KEYWORD):

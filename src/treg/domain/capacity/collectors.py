@@ -15,7 +15,7 @@ from decimal import Decimal, InvalidOperation
 
 import httpx
 
-from ...config import get_settings, platform_setting_name
+from ...config import TREG_USER_AGENT, get_settings, platform_setting_name
 
 # provider → coroutine(client, key) → {"value": float|None, "unit": str, "note": str}.
 # `unit` says what the number IS ("USD", "credits", "units left", "rows used") — the one lesson of
@@ -912,6 +912,13 @@ async def _cloro(c, key):
             "note": f"{d.get('perCycle')} per cycle; cycle resets {(d.get('cycleResetsAt') or '?')[:10]}"}
 
 
+async def _crawl4ai(c, key):
+    d = await _get(c, "https://api.crawl4ai.com/v1/billing/balance", headers={"Authorization": f"Bearer {key}"})
+    mc = d.get("credit_mc")
+    return {"value": _balance(mc / 1000 if type(mc) in (int, float) else None, "Crawl4AI"), "unit": "credits",
+            "note": f"plan {d.get('tier')}"}
+
+
 async def _reapi(c, key):
     # GET /api/v1/balance does not consume credits; 1 credit = $0.001 (reapi.ai/docs/api/balance).
     d = await _get(c, "https://reapi.ai/api/v1/balance", headers={"Authorization": f"Bearer {key}"})
@@ -931,6 +938,7 @@ async def _piapi(c, key):
 BALANCE_ROUTES = {
     "anyapi": _anyapi,
     "cloro": _cloro,
+    "crawl4ai": _crawl4ai,
     "piapi": _piapi,
     "reapi": _reapi,
     "enrichlayer": _enrichlayer,
@@ -1086,7 +1094,7 @@ async def provider_balance(provider: str, client: httpx.AsyncClient | None = Non
                 "note": "no fetcher written yet"}
     try:
         if client is None:
-            async with httpx.AsyncClient(timeout=30) as c:
+            async with httpx.AsyncClient(timeout=30, headers={"User-Agent": TREG_USER_AGENT}) as c:
                 row = await fetch(c, key)
         else:
             row = await fetch(client, key)

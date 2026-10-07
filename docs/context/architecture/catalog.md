@@ -548,8 +548,10 @@ Rules:
   descriptions in different files, is an error; and a proposal that endpoints of two providers use
   is a warning to promote it here, deleting it from every provider file.
 - `capability_titles:` maps an id to a short title people scan on a platform shelf, only where the
-  description runs long. The description stays whole, because agents read it and search ranks on it;
-  the shelf shows it on hover. A title naming no capability fails the catalog load.
+  description runs long. The full description stays available on the comparison page and to agents.
+  Both title and description are indexed by the platform shelf filter, catalog search, and find
+  recall, so shortening a title does not discard the longer search vocabulary. A title naming no
+  capability fails the catalog load.
 - One job, one id. Two ids of one platform with the same description are a validator warning: they
   split one comparison row in two. Rename the losing id on its rows (endpoint ids do not change) and
   check `contracts.yaml` and `adapters.yaml`, which are keyed by capability. Count-only search
@@ -1112,7 +1114,9 @@ option such as a spend cap or memory size can bound what one call costs. An Apif
 `call_fee`, the flat per-run charge settled with its counted rows (money.md, Apify dataset-row settlement). Provider-specific
 request guards bound shapes whose billing formulas need more context than an exact selector:
 Openmart requires its explicit 1-25 record count, while Tavily Map and Crawl require an explicit
-integer limit from 1 to 20. Resolution applies these only after selecting the platform offer and
+integer limit from 1 to 20. Ocean.io search requires an explicit 1-100 page size, and person
+enrichment excludes separately billed contact reveals from the shared-key request. Resolution
+applies these only after selecting the platform offer and
 before reserve; a team's own credential retains the upstream contract.
 
 A second treg-set kind, **`kind: treg_trial`**, prices a provider at exactly **$0** with a
@@ -1874,6 +1878,14 @@ to choose (`docs/CAPABILITY-ROUTING-PLAN.md`). Everything else in the catalog st
   the plan with the reason, not ranked down like an ignored filter: a title-only search asked for
   one company's CEO returns title-matched strangers for any company and bills them as a hit. The
   rule is per candidate, so `{q, company_domain}` also drops the `q`-only providers.
+  `prefer` is the contract's default provider order, used when the caller sends no
+  `X-Treg-Route-Prefer` (a caller's header replaces it). Cost per hit ignores time:
+  `ai-search.perplexity.answer` sets `prefer: [dataforseo]` because cost per hit ranked the cheaper
+  but slower and less reliable cloro first. Its `source_kind` output says
+  whether the answer read the Perplexity website (`website`, cloro) or its model API (`model_api`).
+  In `web.extract.structured` (a URL plus a JSON `schema` and/or an `instruction`) the most complete
+  identity variant is listed first, because the first variant a caller fills is the one every field
+  rides on.
 - **Adapters** — `adapters.yaml`, one per endpoint: `accepts` (identity variants), `in` (contract
   field → `queryParams.x` / `body.x`), `const` (fixed provider params), `out` (core field →
   expression over the body), `miss`, and `route: false` for an adapter that only judges hit/miss
@@ -1924,8 +1936,10 @@ to choose (`docs/CAPABILITY-ROUTING-PLAN.md`). Everything else in the catalog st
 - **Execution** — `application/call/route.py`, entered from `service._execute_call` when the
   resolved catalog row is `kind: routed`. Each attempt is a **full child `execute_call`** on a
   `CallContext` whose `call_ref` is `{parent}:r{n}` — its hold id, ladder (tiers 1/2/4/overflow),
-  reserve, relay, settle, audit row and cancellation compensation are the ordinary ones. Vendor
-  4xx (not 402/408/429) = usually the caller's fault, but scrapers answer 400 for their own outages
+  reserve, relay, settle, audit row and cancellation compensation are the ordinary ones. A 405 or
+  410 Gone is the provider's own (a discontinued route answers 410 to every request) and falls over
+  like a 5xx. Vendor
+  4xx (not 402/405/408/410/429) = usually the caller's fault, but scrapers answer 400 for their own outages
   (tikhub, live 2026-08-28), so the waterfall goes on ONLY to candidates that bill nothing for a
   rejected request — per_success, free, the org's own key, or per_call ≤ 1¢ (`CHEAP_RETRY_MICRO`;
   since 2026-09-07 a per_call rejection settles only at a charge the vendor itself reports, so this

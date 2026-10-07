@@ -52,7 +52,7 @@ endpoints:
       body:
         platform: {type: string, required: true, note: "one of instagram | youtube | tiktok | twitter | twitch | onlyfans — the filter set changes with it", example: "instagram"}
         paging: {type: object, required: true, note: "{limit, page}; page is 0-indexed. THIS IS THE PRICE DIAL — 0.01 credit per creator returned", example: {limit: 10, page: 0}}
-        filters: {type: object, required: true, note: "platform-specific filter object (send {} to rely on nlp_search alone). Instagram keys include location, profile_language, keywords_in_bio, hashtags, keywords_in_captions, number_of_followers {min,max}, engagement_percent {min,max}, average_likes, follower_growth, last_post, is_verified, brands, audience {age, gender, location, interests}, has_done_brand_deals, promotes_affiliate_links, exclude_handles, exclude_list. TRAPS learned live (2026-08-27): `location` is COUNTRY-level and must be a dictionary value ([\"Brazil\"]) — a city string ('Belo Horizonte, MG') is accepted and silently matches nothing; `profile_language` is a LIST of ISO codes from creators.filters.values ([\"pt\"], not \"portuguese\" → 400); a required brand goes in `brands: [\"nitto\"]` (lowercase), NOT keywords_in_bio (\"Nitto tires\" in a bio matches nothing); keywords_in_bio wants short single words in the creators' own language (\"cabelo\", not \"queda de cabelo\")", example: {keywords_in_bio: ["astronomy"], number_of_followers: {min: 100000}}}
+        filters: {type: object, required: true, note: "platform-specific filter object (send {} to rely on nlp_search alone). Instagram keys include location, profile_language, keywords_in_bio, hashtags, keywords_in_captions, number_of_followers {min,max}, engagement_percent {min,max}, average_likes, follower_growth, last_post, is_verified, brands, audience {age, gender, location, interests}, has_done_brand_deals, promotes_affiliate_links, exclude_handles, exclude_list. TRAPS learned live (2026-08-27): `location` is COUNTRY-level and must be a dictionary value ([\"Brazil\"]) — a city string ('Belo Horizonte, MG') is accepted and silently matches nothing; `profile_language` is a LIST of ISO codes from creators.filters.values ([\"pt\"], not \"portuguese\" → 400); a required brand goes in `brands: [\"nitto\"]` (lowercase), NOT keywords_in_bio (\"Nitto tires\" in a bio matches nothing); keywords_in_bio wants short single words in the creators' own language (\"cabelo\", not \"queda de cabelo\"). On platform tiktok (live 2026-10-04): location, profile_language, number_of_followers and keywords_in_bio filter; keywords_in_captions is silently IGNORED (any value returns the unfiltered total) and hashtags matches loosely — put topic words in keywords_in_bio", example: {keywords_in_bio: ["astronomy"], number_of_followers: {min: 100000}}}
         nlp_search: {type: string, required: false, note: "a plain-language brief ('fitness creators in New York with over 100k followers') that the API maps onto filters; combinable with explicit filters. The response adds applied_filters and an nlp_search block explaining what was inferred or dropped. An uninterpretable brief 400s and costs nothing. It DROPS constraints it cannot map (a 'Brazilian hair-loss creators' brief came back without the country or topic) — put every hard limit in `filters` and use nlp_search only for the soft part", example: "astronomy and space creators with over 100k followers"}
         sort: {type: object, required: false, note: "{sort_by: relevancy | engagement_rate | number_of_followers | growth_rate, sort_order: asc | desc}", example: {sort_by: number_of_followers, sort_order: desc}}
       queryParams:
@@ -70,7 +70,8 @@ endpoints:
       source_url: https://docs.influencers.club/guides/usage-limits
       checked: '2026-08-21'
       confidence: verified
-      note: "0.01 credit per creator returned, 0 creators = 0 credits. OBSERVED 2026-08-21: limit=2 moved the meter 10.00 -> 9.98. return_filter_values=true is documented at 0.03 per creator (not observed)"
+      reported_charge: {path: credits_cost, unit: credit}
+      note: "0.01 credit per creator returned, 0 creators = 0 credits; 0.03 with return_filter_values=true. The response's credits_cost is the exact charge and settles the call, so the premium rider is billed as charged. OBSERVED 2026-08-21: limit=2 moved the meter 10.00 -> 9.98"
     verified: '2026-08-21'
     example_response: examples/influencersclub.creators.search.json
     docs_url: https://docs.influencers.club/openapi/discovery-api/public_v1_discovery_create
@@ -100,6 +101,7 @@ endpoints:
       currency: credit
       per: 1
       unit: result
+      reported_charge: {path: credits_cost, unit: credit}
       source: observed
       source_url: https://docs.influencers.club/guides/usage-limits
       checked: '2026-08-21'
